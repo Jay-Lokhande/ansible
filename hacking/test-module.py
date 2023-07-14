@@ -18,134 +18,83 @@
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-# this script is for testing modules without running through the
-# entire guts of ansible, and is very helpful for when developing
-# modules
-#
-# example:
-#    ./hacking/test-module.py -m lib/ansible/modules/command.py -a "/bin/sleep 3"
-#    ./hacking/test-module.py -m lib/ansible/modules/command.py -a "/bin/sleep 3" --debugger /usr/bin/pdb
-#    ./hacking/test-module.py -m lib/ansible/modules/lineinfile.py -a "dest=/etc/exports line='/srv/home hostname1(rw,sync)'" --check
-#    ./hacking/test-module.py -m lib/ansible/modules/command.py -a "echo hello" -n -o "test_hello"
+# This script is for testing modules without running through the
+# entire guts of Ansible and is very helpful for when developing
+# modules.
 
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import absolute_import, division, print_function
 
-import glob
-import optparse
+import argparse
+import json
 import os
 import subprocess
 import sys
 import traceback
-import shutil
 
-from ansible.release import __version__
-import ansible.utils.vars as utils_vars
+from ansible.module_utils.common.text.converters import to_text
 from ansible.parsing.dataloader import DataLoader
-from ansible.parsing.utils.jsonify import jsonify
-from ansible.parsing.splitter import parse_kv
 from ansible.plugins.loader import init_plugin_loader
-from ansible.executor import module_common
-import ansible.constants as C
-from ansible.module_utils.common.text.converters import to_native, to_text
 from ansible.template import Templar
 
-import json
+from ansible.release import __version__
+from ansible.executor import module_common
+import ansible.constants as C
 
 
 def parse():
-    """parse command line
+    """Parse command-line arguments.
 
-    :return : (options, args)"""
-    parser = optparse.OptionParser()
-
-    parser.usage = "%prog -[options] (-h for help)"
-
-    parser.add_option('-m', '--module-path', dest='module_path',
-                      help="REQUIRED: full path of module source to execute")
-    parser.add_option('-a', '--args', dest='module_args', default="",
-                      help="module argument string")
-    parser.add_option('-D', '--debugger', dest='debugger',
-                      help="path to python debugger (e.g. /usr/bin/pdb)")
-    parser.add_option('-I', '--interpreter', dest='interpreter',
-                      help="path to interpreter to use for this module"
-                      " (e.g. ansible_python_interpreter=/usr/bin/python)",
-                      metavar='INTERPRETER_TYPE=INTERPRETER_PATH',
-                      default="ansible_python_interpreter=%s" %
-                      (sys.executable if sys.executable else '/usr/bin/python'))
-    parser.add_option('-c', '--check', dest='check', action='store_true',
-                      help="run the module in check mode")
-    parser.add_option('-n', '--noexecute', dest='execute', action='store_false',
-                      default=True, help="do not run the resulting module")
-    parser.add_option('-o', '--output', dest='filename',
-                      help="Filename for resulting module",
-                      default="~/.ansible_module_generated")
-    options, args = parser.parse_args()
-    if not options.module_path:
-        parser.print_help()
-        sys.exit(1)
-    else:
-        return options, args
-
-
-def write_argsfile(argstring, json=False):
-    """ Write args to a file for old-style module's use. """
-    argspath = os.path.expanduser("~/.ansible_test_module_arguments")
-    argsfile = open(argspath, 'w')
-    if json:
-        args = parse_kv(argstring)
-        argstring = jsonify(args)
-    argsfile.write(argstring)
-    argsfile.close()
-    return argspath
-
-
-def get_interpreters(interpreter):
-    result = dict()
-    if interpreter:
-        if '=' not in interpreter:
-            print("interpreter must by in the form of ansible_python_interpreter=/usr/bin/python")
-            sys.exit(1)
-        interpreter_type, interpreter_path = interpreter.split('=')
-        if not interpreter_type.startswith('ansible_'):
-            interpreter_type = 'ansible_%s' % interpreter_type
-        if not interpreter_type.endswith('_interpreter'):
-            interpreter_type = '%s_interpreter' % interpreter_type
-        result[interpreter_type] = interpreter_path
-    return result
+    :return : argparse.Namespace
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-m', '--module-path', dest='module_path',
+                        help="REQUIRED: full path of module source to execute")
+    parser.add_argument('-a', '--args', dest='module_args', default="",
+                        help="module argument string")
+    parser.add_argument('-D', '--debugger', dest='debugger',
+                        help="path to python debugger (e.g. /usr/bin/pdb)")
+    parser.add_argument('-I', '--interpreter', dest='interpreter',
+                        help="path to interpreter to use for this module"
+                             " (e.g. ansible_python_interpreter=/usr/bin/python)",
+                        metavar='INTERPRETER_TYPE=INTERPRETER_PATH',
+                        default="ansible_python_interpreter={}".format(sys.executable if sys.executable else '/usr/bin/python'))
+    parser.add_argument('-c', '--check', dest='check', action='store_true',
+                        help="run the module in check mode")
+    parser.add_argument('-n', '--noexecute', dest='execute', action='store_false',
+                        default=True, help="do not run the resulting module")
+    parser.add_argument('-o', '--output', dest='filename',
+                        help="Filename for resulting module",
+                        default="~/.ansible_module_generated")
+    return parser.parse_args()
 
 
 def boilerplate_module(modfile, args, interpreters, check, destfile):
-    """ simulate what ansible does with new style modules """
+    """Simulate what Ansible does with new-style modules.
 
-    # module_fh = open(modfile)
-    # module_data = module_fh.read()
-    # module_fh.close()
-
-    # replacer = module_common.ModuleReplacer()
+    :param modfile: str, path to the module source file
+    :param args: str, module argument string
+    :param interpreters: dict, interpreter information
+    :param check: bool, check mode flag
+    :param destfile: str, path to the destination file
+    :return: (str, str, str), modified module file path, module name, module style
+    """
     loader = DataLoader()
-
-    # included_boilerplate = module_data.find(module_common.REPLACER) != -1 or module_data.find("import ansible.module_utils") != -1
-
     complex_args = {}
 
-    # default selinux fs list is pass in as _ansible_selinux_special_fs arg
     complex_args['_ansible_selinux_special_fs'] = C.DEFAULT_SELINUX_SPECIAL_FS
     complex_args['_ansible_tmpdir'] = C.DEFAULT_LOCAL_TMP
     complex_args['_ansible_keep_remote_files'] = C.DEFAULT_KEEP_REMOTE_FILES
     complex_args['_ansible_version'] = __version__
 
     if args.startswith("@"):
-        # Argument is a YAML file (JSON is a subset of YAML)
         complex_args = utils_vars.combine_vars(complex_args, loader.load_from_file(args[1:]))
         args = ''
     elif args.startswith("{"):
-        # Argument is a YAML document (not a file)
         complex_args = utils_vars.combine_vars(complex_args, loader.load(args))
         args = ''
 
     if args:
-        parsed_args = parse_kv(args)
+        parsed_args = module_common.parse_kv(args)
         complex_args = utils_vars.combine_vars(complex_args, parsed_args)
 
     task_vars = interpreters
@@ -163,23 +112,67 @@ def boilerplate_module(modfile, args, interpreters, check, destfile):
         task_vars=task_vars
     )
 
-    if module_style == 'new' and '_ANSIBALLZ_WRAPPER = True' in to_native(module_data):
+    if module_style == 'new' and '_ANSIBALLZ_WRAPPER = True' in to_text(module_data):
         module_style = 'ansiballz'
 
     modfile2_path = os.path.expanduser(destfile)
-    print("* including generated source, if any, saving to: %s" % modfile2_path)
+    print("* including generated source, if any, saving to: {}".format(modfile2_path))
     if module_style not in ('ansiballz', 'old'):
         print("* this may offset any line numbers in tracebacks/debuggers!")
-    modfile2 = open(modfile2_path, 'wb')
-    modfile2.write(module_data)
-    modfile2.close()
-    modfile = modfile2_path
+    with open(modfile2_path, 'wb') as modfile2:
+        modfile2.write(module_data)
 
-    return (modfile2_path, modname, module_style)
+    return modfile2_path, modname, module_style
+
+
+def runtest(modfile, modname, module_style, interpreters):
+    """Test run a module, piping its output for reporting.
+
+    :param modfile: str, path to the module source file
+    :param modname: str, module name
+    :param module_style: str, module style
+    :param interpreters: dict, interpreter information
+    """
+    invoke = ""
+    if module_style == 'ansiballz':
+        modfile, _ = ansiballz_setup(modfile, modname, interpreters)
+        if 'ansible_python_interpreter' in interpreters:
+            invoke = "{} ".format(interpreters['ansible_python_interpreter'])
+
+    os.chmod(modfile, 0o755)
+    invoke = "{}{}".format(invoke, modfile)
+
+    cmd = subprocess.Popen(invoke, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = cmd.communicate()
+    out, err = to_text(out), to_text(err)
+
+    try:
+        print("*" * 35)
+        print("RAW OUTPUT")
+        print(out)
+        print(err)
+        results = json.loads(out)
+    except Exception:
+        print("*" * 35)
+        print("INVALID OUTPUT FORMAT")
+        print(out)
+        traceback.print_exc()
+        sys.exit(1)
+
+    print("*" * 35)
+    print("PARSED OUTPUT")
+    print(json.dumps(results, indent=4, sort_keys=True))
 
 
 def ansiballz_setup(modfile, modname, interpreters):
-    os.system("chmod +x %s" % modfile)
+    """Set up an AnsiBallZ module by exploding its contents.
+
+    :param modfile: str, path to the module source file
+    :param modname: str, module name
+    :param interpreters: dict, interpreter information
+    :return: (str, str), modified module file path, args file path
+    """
+    os.chmod(modfile, 0o755)
 
     if 'ansible_python_interpreter' in interpreters:
         command = [interpreters['ansible_python_interpreter']]
@@ -198,11 +191,9 @@ def ansiballz_setup(modfile, modname, interpreters):
         sys.exit(err)
     debug_dir = lines[1].strip()
 
-    # All the directories in an AnsiBallZ that modules can live
     core_dirs = glob.glob(os.path.join(debug_dir, 'ansible/modules'))
     collection_dirs = glob.glob(os.path.join(debug_dir, 'ansible_collections/*/*/plugins/modules'))
 
-    # There's only one module in an AnsiBallZ payload so look for the first module and then exit
     for module_dir in core_dirs + collection_dirs:
         for dirname, directories, filenames in os.walk(module_dir):
             for filename in filenames:
@@ -212,79 +203,22 @@ def ansiballz_setup(modfile, modname, interpreters):
 
     argsfile = os.path.join(debug_dir, 'args')
 
-    print("* ansiballz module detected; extracted module source to: %s" % debug_dir)
+    print("* ansiballz module detected; extracted module source to: {}".format(debug_dir))
     return modfile, argsfile
 
 
-def runtest(modfile, argspath, modname, module_style, interpreters):
-    """Test run a module, piping it's output for reporting."""
-    invoke = ""
-    if module_style == 'ansiballz':
-        modfile, argspath = ansiballz_setup(modfile, modname, interpreters)
-        if 'ansible_python_interpreter' in interpreters:
-            invoke = "%s " % interpreters['ansible_python_interpreter']
-
-    os.system("chmod +x %s" % modfile)
-
-    invoke = "%s%s" % (invoke, modfile)
-    if argspath is not None:
-        invoke = "%s %s" % (invoke, argspath)
-
-    cmd = subprocess.Popen(invoke, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    (out, err) = cmd.communicate()
-    out, err = to_text(out), to_text(err)
-
-    try:
-        print("*" * 35)
-        print("RAW OUTPUT")
-        print(out)
-        print(err)
-        results = json.loads(out)
-    except Exception:
-        print("*" * 35)
-        print("INVALID OUTPUT FORMAT")
-        print(out)
-        traceback.print_exc()
-        sys.exit(1)
-
-    print("*" * 35)
-    print("PARSED OUTPUT")
-    print(jsonify(results, format=True))
-
-
-def rundebug(debugger, modfile, argspath, modname, module_style, interpreters):
-    """Run interactively with console debugger."""
-
-    if module_style == 'ansiballz':
-        modfile, argspath = ansiballz_setup(modfile, modname, interpreters)
-
-    if argspath is not None:
-        subprocess.call("%s %s %s" % (debugger, modfile, argspath), shell=True)
-    else:
-        subprocess.call("%s %s" % (debugger, modfile), shell=True)
-
-
 def main():
-
-    options, args = parse()
+    args = parse()
     init_plugin_loader()
-    interpreters = get_interpreters(options.interpreter)
-    (modfile, modname, module_style) = boilerplate_module(options.module_path, options.module_args, interpreters, options.check, options.filename)
+    interpreters = module_common.get_interpreters(args.interpreter)
+    modfile, modname, module_style = boilerplate_module(args.module_path, args.module_args, interpreters,
+                                                        args.check, args.filename)
 
-    argspath = None
-    if module_style not in ('new', 'ansiballz'):
-        if module_style in ('non_native_want_json', 'binary'):
-            argspath = write_argsfile(options.module_args, json=True)
-        elif module_style == 'old':
-            argspath = write_argsfile(options.module_args, json=False)
+    if args.execute:
+        if args.debugger:
+            rundebug(args.debugger, modfile, modname, module_style, interpreters)
         else:
-            raise Exception("internal error, unexpected module style: %s" % module_style)
-
-    if options.execute:
-        if options.debugger:
-            rundebug(options.debugger, modfile, argspath, modname, module_style, interpreters)
-        else:
-            runtest(modfile, argspath, modname, module_style, interpreters)
+            runtest(modfile, modname, module_style, interpreters)
 
 
 if __name__ == "__main__":
